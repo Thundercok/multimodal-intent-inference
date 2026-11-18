@@ -61,61 +61,87 @@ public final class MagneticSnappingEngine {
         targets.removeAll()
     }
 
-    /// Calculate snapped cursor position given raw cursor coordinate and instantaneous velocity (in px/sec)
-    public func applySnapping(cursorPos: CGPoint, speedPxPerSec: CGFloat) -> CGPoint {
+    /// Target geometry context for policy observation (zero oracle knowledge)
+    public struct NearestTargetInfo {
+        public let target: SnapTarget
+        public let distance: CGFloat
+        public let dx: CGFloat
+        public let dy: CGFloat
+    }
+
+    /// Returns nearest registered target within active snap basin (`2.5 * snapRadius`), if any.
+    public func nearestTargetInfo(for cursorPos: CGPoint) -> NearestTargetInfo? {
+        guard isEnabled, !targets.isEmpty else {
+            return nil
+        }
+        var bestTarget: SnapTarget?
+        var minDistance: CGFloat = .infinity
+        var bestDx: CGFloat = 0.0
+        var bestDy: CGFloat = 0.0
+
+        for target in targets {
+            let center = target.center
+            let dx = center.x - cursorPos.x
+            let dy = center.y - cursorPos.y
+            let dist = hypot(dx, dy)
+            if dist < target.snapRadius * 2.5 && dist < minDistance {
+                minDistance = dist
+                bestTarget = target
+                bestDx = dx
+                bestDy = dy
+            }
+        }
+
+        guard let target = bestTarget else { return nil }
+        return NearestTargetInfo(target: target, distance: minDistance, dx: bestDx, dy: bestDy)
+    }
+
+    /// Calculate snapped cursor position given raw cursor coordinate, velocity (in px/sec),
+    /// and optional RL policy snap gain override (`snapGainOverride` in `[0, 0.85]`).
+    public func applySnapping(
+        cursorPos: CGPoint,
+        speedPxPerSec: CGFloat,
+        snapGainOverride: CGFloat? = nil
+    ) -> CGPoint {
         guard isEnabled, !targets.isEmpty else {
             return cursorPos
         }
 
-        // 1. Breakaway velocity weight w_v in [0, 1]
-        let velocityWeight: CGFloat
-        if speedPxPerSec <= lowSpeedThreshold {
-            velocityWeight = 1.0
-        } else if speedPxPerSec >= breakawayThreshold {
-            velocityWeight = 0.0
+        // 1. Resolve nearest target once (early return before checking velocity when no targets nearby)
+        let targetInfo = nearestTargetInfo(for: cursorPos)
+        guard let info = targetInfo, info.distance >= 0.001 else {
+            return cursorPos
+        }
+
+        // 2. Determine effective snap gain (RL override or Hermite velocity breakaway heuristic)
+        let effectiveGain: CGFloat
+        if let overrideGain = snapGainOverride {
+            effectiveGain = max(0.0, min(0.85, overrideGain))
         } else {
-            let t = (speedPxPerSec - lowSpeedThreshold) / (breakawayThreshold - lowSpeedThreshold)
-            // Smoothstep hermite interpolation: 1 - (3t^2 - 2t^3)
-            velocityWeight = 1.0 - (3.0 * t * t - 2.0 * t * t * t)
-        }
-
-        if velocityWeight <= 0.001 {
-            return cursorPos
-        }
-
-        // 2. Find nearest target whose basin contains the cursor
-        var nearestTarget: SnapTarget?
-        var minDistance: CGFloat = .infinity
-
-        for target in targets {
-            let center = target.center
-            let dist = hypot(center.x - cursorPos.x, center.y - cursorPos.y)
-            if dist < target.snapRadius * 2.5 && dist < minDistance {
-                minDistance = dist
-                nearestTarget = target
+            let velocityWeight: CGFloat
+            if speedPxPerSec <= lowSpeedThreshold {
+                velocityWeight = 1.0
+            } else if speedPxPerSec >= breakawayThreshold {
+                velocityWeight = 0.0
+            } else {
+                let t = (speedPxPerSec - lowSpeedThreshold) / (breakawayThreshold - lowSpeedThreshold)
+                // Smoothstep hermite interpolation: 1 - (3t^2 - 2t^3)
+                velocityWeight = 1.0 - (3.0 * t * t - 2.0 * t * t * t)
             }
+            effectiveGain = info.target.strength * velocityWeight
         }
 
-        guard let target = nearestTarget else {
-            return cursorPos
-        }
-
-        let center = target.center
-        let dx = center.x - cursorPos.x
-        let dy = center.y - cursorPos.y
-        let dist = hypot(dx, dy)
-
-        if dist < 0.001 {
+        if effectiveGain <= 0.001 {
             return cursorPos
         }
 
         // 3. Gaussian attraction potential
-        let sigma = target.snapRadius * 0.707 // sigma chosen so peak pull is within target margin
-        let gaussian = exp(-CGFloat(dist * dist) / (2.0 * sigma * sigma))
-        let pullFactor = target.strength * velocityWeight * gaussian
+        let sigma = info.target.snapRadius * 0.707 // sigma chosen so peak pull is within target margin
+        let gaussian = exp(-CGFloat(info.distance * info.distance) / (2.0 * sigma * sigma))
+        let pullFactor = effectiveGain * gaussian
 
-        let snappedX = cursorPos.x + dx * pullFactor
-        let snappedY = cursorPos.y + dy * pullFactor
+        let snappedX = cursorPos.x + info.dx * pullFactor
+        let snappedY = cursorPos.y + info.dy * pullFactor
 
         return CGPoint(x: snappedX, y: snappedY)
     }

@@ -28,11 +28,105 @@ import random
 import argparse
 import json
 from dataclasses import dataclass, asdict
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
+
+
+class RLFrictionPolicyLoader:
+    """
+    Loads the Phase 3 PPO-trained MLP weights (`dynamic_friction_policy.json`)
+    for zero-oracle target-agnostic evaluation inside bench_fitts.py.
+    """
+
+    def __init__(self, json_path: Optional[str] = None):
+        if json_path is None:
+            json_path = os.path.join(REPO_ROOT, "GestureFlowApp/Resources/dynamic_friction_policy.json")
+        self.available = False
+        self.cutoff_min = 0.25
+        self.cutoff_max = 4.00
+        self.snap_min = 0.00
+        self.snap_max = 0.85
+        self.weights = None
+
+        if os.path.isfile(json_path):
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            meta = data.get("metadata", {})
+            c_range = meta.get("cutoff_range", [0.25, 4.00])
+            s_range = meta.get("snap_gain_range", [0.00, 0.85])
+            self.cutoff_min, self.cutoff_max = float(c_range[0]), float(c_range[1])
+            self.snap_min, self.snap_max = float(s_range[0]), float(s_range[1])
+            self.weights = data["weights"]
+            self.available = True
+
+    @staticmethod
+    def _mlp_layer(x: List[float], w: List[List[float]], b: List[float]) -> List[float]:
+        out_dim = len(b)
+        res = []
+        for j in range(out_dim):
+            acc = b[j]
+            for i, xi in enumerate(x):
+                acc += xi * w[i][j]
+            res.append(math.tanh(max(-15.0, min(15.0, acc))))
+        return res
+
+    def predict(
+        self,
+        cursor_x: float,
+        cursor_y: float,
+        vel_x: float,
+        vel_y: float,
+        speed_px_s: float,
+        accel_px_s2: float,
+        visible_targets: List["FittsTarget"],
+        aperture: float,
+    ) -> Tuple[float, float]:
+        if not self.available or self.weights is None:
+            ratio = min(1.0, max(0.0, speed_px_s / 450.0))
+            return 0.40 + 2.10 * (ratio * ratio), 0.65
+
+        norm_speed = min(2.0, max(0.0, speed_px_s / 600.0))
+        norm_accel = max(-2.0, min(2.0, accel_px_s2 / 3000.0))
+
+        nearest = None
+        min_dist = float("inf")
+        snap_radius = 49.0
+        for t in visible_targets:
+            r_snap = max(30.0, t.radius + 25.0)
+            d = math.hypot(t.center_x - cursor_x, t.center_y - cursor_y)
+            if d < r_snap * 2.5 and d < min_dist:
+                min_dist = d
+                nearest = t
+                snap_radius = r_snap
+
+        if nearest is not None:
+            has_prox = 1.0
+            norm_dist = min(1.0, min_dist / (2.5 * snap_radius))
+            dx = nearest.center_x - cursor_x
+            dy = nearest.center_y - cursor_y
+            v_norm = math.hypot(vel_x, vel_y)
+            if min_dist > 1e-3 and v_norm > 1e-3:
+                radial_align = max(-1.0, min(1.0, (dx * vel_x + dy * vel_y) / (min_dist * v_norm)))
+            else:
+                radial_align = 0.0
+        else:
+            has_prox = 0.0
+            norm_dist = 1.0
+            radial_align = 0.0
+
+        ap_ratio = max(0.0, min(1.0, aperture))
+        obs = [norm_speed, norm_accel, has_prox, norm_dist, radial_align, ap_ratio]
+
+        h0 = self._mlp_layer(obs, self.weights["w0"], self.weights["b0"])
+        h1 = self._mlp_layer(h0, self.weights["w1"], self.weights["b1"])
+        out = self._mlp_layer(h1, self.weights["w2"], self.weights["b2"])
+
+        cutoff = self.cutoff_min + (self.cutoff_max - self.cutoff_min) * 0.5 * (out[0] + 1.0)
+        snap_gain = self.snap_min + (self.snap_max - self.snap_min) * 0.5 * (out[1] + 1.0)
+        return cutoff, snap_gain
 
 
 @dataclass
@@ -188,6 +282,7 @@ class FittsBenchmarkRunner:
         self.circle_radius = circle_radius
         self.center = center
         self.simulator = FittsKinematicSimulator()
+        self.rl_policy = RLFrictionPolicyLoader()
 
     def generate_iso_targets(self, n_targets: int = 16, target_width: float = 48.0) -> List[FittsTarget]:
         targets = []
@@ -209,12 +304,14 @@ class FittsBenchmarkRunner:
         condition: str,
         start_target: FittsTarget,
         dest_target: FittsTarget,
-        seed: int
+        seed: int,
+        visible_targets: Optional[List[FittsTarget]] = None
     ) -> TrialMetrics:
         # Distance between start and destination
         D = math.hypot(dest_target.center_x - start_target.center_x, dest_target.center_y - start_target.center_y)
         W = dest_target.width
         shannon_id = math.log2(D / W + 1.0)
+        targets_in_scene = visible_targets if visible_targets is not None else [dest_target]
 
         # Generate human minimum-jerk trajectory with tremor & click twitch
         raw_frames = self.simulator.generate_movement(
@@ -225,27 +322,39 @@ class FittsBenchmarkRunner:
         )
 
         # Initialize filters
-        filter_x = OneEuroFilter1D(min_cutoff=0.40 if "viscous" in condition or "full" in condition else 1.10, beta=0.035)
-        filter_y = OneEuroFilter1D(min_cutoff=0.40 if "viscous" in condition or "full" in condition else 1.10, beta=0.035)
+        use_low_init = ("viscous" in condition or "full" in condition or "rl" in condition)
+        filter_x = OneEuroFilter1D(min_cutoff=0.40 if use_low_init else 1.10, beta=0.035)
+        filter_y = OneEuroFilter1D(min_cutoff=0.40 if use_low_init else 1.10, beta=0.035)
 
         processed_points = []
         pre_click_locked_point = None
-        pre_click_frames_left = 0
         overshoots = 0
         was_inside = False
 
         prev_raw_point = None
         prev_speed = 0.0
+        prev_vel_vec = (0.0, 0.0)
+        prev_accel = 0.0
+        last_cursor_pos = (start_target.center_x, start_target.center_y)
 
         for idx, frame in enumerate(raw_frames):
             t = frame["time"]
             rx, ry = frame["x"], frame["y"]
             aperture = frame["aperture"]
 
-            # Compute raw velocity
+            # Compute raw velocity and smoothed signed acceleration
             if prev_raw_point is not None:
-                inst_speed = math.hypot(rx - prev_raw_point[0], ry - prev_raw_point[1]) / 0.016667
-                prev_speed = 0.35 * inst_speed + 0.65 * prev_speed
+                vx_raw = (rx - prev_raw_point[0]) / 0.016667
+                vy_raw = (ry - prev_raw_point[1]) / 0.016667
+                inst_speed = math.hypot(vx_raw, vy_raw)
+                new_speed = 0.35 * inst_speed + 0.65 * prev_speed
+                inst_accel = (new_speed - prev_speed) / 0.016667
+                prev_vel_vec = (
+                    0.35 * vx_raw + 0.65 * prev_vel_vec[0],
+                    0.35 * vy_raw + 0.65 * prev_vel_vec[1]
+                )
+                prev_speed = new_speed
+                prev_accel = 0.4 * inst_accel + 0.6 * prev_accel
             else:
                 prev_speed = 0.0
             prev_raw_point = (rx, ry)
@@ -279,10 +388,9 @@ class FittsBenchmarkRunner:
             elif condition == "magnetic_snapping":
                 fx = filter_x.filter(rx, t, dynamic_min_cutoff=1.10)
                 fy = filter_y.filter(ry, t, dynamic_min_cutoff=1.10)
-                # Apply Gaussian potential well towards dest_target
-                px, py = self._apply_magnetic_snap(fx, fy, dest_target, prev_speed)
+                px, py = self._apply_magnetic_snap_multi(fx, fy, targets_in_scene, prev_speed)
 
-            # 6. Condition: Full GestureFlow Architecture (Viscous + PreClick + Magnetic)
+            # 6. Condition: Full GestureFlow Architecture (Viscous + PreClick + Magnetic Heuristic)
             elif condition == "full_gestureflow":
                 ratio = min(1.0, max(0.0, prev_speed / 450.0))
                 dynamic_cutoff = 0.40 + (2.50 - 0.40) * (ratio * ratio)
@@ -294,11 +402,34 @@ class FittsBenchmarkRunner:
                 if pre_click_locked_point is not None:
                     fx, fy = pre_click_locked_point
 
-                px, py = self._apply_magnetic_snap(fx, fy, dest_target, prev_speed)
+                px, py = self._apply_magnetic_snap_multi(fx, fy, targets_in_scene, prev_speed)
+
+            # 7. Condition: PPO RL Dynamic Friction Policy + Pre-Click Lock (Zero-Oracle)
+            elif condition == "rl_friction":
+                cutoff_hz, snap_gain = self.rl_policy.predict(
+                    cursor_x=last_cursor_pos[0],
+                    cursor_y=last_cursor_pos[1],
+                    vel_x=prev_vel_vec[0],
+                    vel_y=prev_vel_vec[1],
+                    speed_px_s=prev_speed,
+                    accel_px_s2=prev_accel,
+                    visible_targets=targets_in_scene,
+                    aperture=aperture,
+                )
+                fx = filter_x.filter(rx, t, dynamic_min_cutoff=cutoff_hz)
+                fy = filter_y.filter(ry, t, dynamic_min_cutoff=cutoff_hz)
+
+                if pre_click_locked_point is not None:
+                    px, py = pre_click_locked_point
+                else:
+                    px, py = self._apply_magnetic_snap_multi(fx, fy, targets_in_scene, prev_speed, snap_gain_override=snap_gain)
+                    if aperture <= 0.48:
+                        pre_click_locked_point = (px, py)
 
             else:
                 raise ValueError(f"Unknown condition: {condition}")
 
+            last_cursor_pos = (px, py)
             processed_points.append((t, px, py))
 
             # Overshoot tracking
@@ -352,29 +483,63 @@ class FittsBenchmarkRunner:
         )
 
     @staticmethod
-    def _apply_magnetic_snap(x: float, y: float, target: FittsTarget, speed_px_s: float) -> Tuple[float, float]:
+    def _apply_magnetic_snap(
+        x: float,
+        y: float,
+        target: FittsTarget,
+        speed_px_s: float,
+        snap_gain_override: Optional[float] = None
+    ) -> Tuple[float, float]:
         dx = target.center_x - x
         dy = target.center_y - y
         dist = math.hypot(dx, dy)
-        snap_radius = target.radius + 25.0
+        snap_radius = max(30.0, target.radius + 25.0)
 
         if dist > snap_radius * 2.5 or dist < 0.001:
             return x, y
 
-        # Breakaway velocity weight: drops from 1.0 at 200 px/s to 0.0 at 650 px/s
-        if speed_px_s <= 200.0:
-            wv = 1.0
-        elif speed_px_s >= 650.0:
-            wv = 0.0
+        if snap_gain_override is not None:
+            effective_gain = max(0.0, min(0.85, snap_gain_override))
         else:
-            t = (speed_px_s - 200.0) / (650.0 - 200.0)
-            wv = 1.0 - (3.0 * t * t - 2.0 * t * t * t)
+            # Breakaway velocity weight: drops from 1.0 at 200 px/s to 0.0 at 650 px/s
+            if speed_px_s <= 200.0:
+                wv = 1.0
+            elif speed_px_s >= 650.0:
+                wv = 0.0
+            else:
+                t = (speed_px_s - 200.0) / (650.0 - 200.0)
+                wv = 1.0 - (3.0 * t * t - 2.0 * t * t * t)
+            effective_gain = 0.65 * wv
+
+        if effective_gain <= 0.001:
+            return x, y
 
         sigma = snap_radius * 0.707
         gaussian = math.exp(-(dist * dist) / (2.0 * sigma * sigma))
-        pull = 0.65 * wv * gaussian
+        pull = effective_gain * gaussian
 
         return x + dx * pull, y + dy * pull
+
+    @classmethod
+    def _apply_magnetic_snap_multi(
+        cls,
+        x: float,
+        y: float,
+        visible_targets: List[FittsTarget],
+        speed_px_s: float,
+        snap_gain_override: Optional[float] = None
+    ) -> Tuple[float, float]:
+        nearest = None
+        min_dist = float("inf")
+        for target in visible_targets:
+            snap_r = max(30.0, target.radius + 25.0)
+            d = math.hypot(target.center_x - x, target.center_y - y)
+            if d < snap_r * 2.5 and d < min_dist:
+                min_dist = d
+                nearest = target
+        if nearest is None:
+            return x, y
+        return cls._apply_magnetic_snap(x, y, nearest, speed_px_s, snap_gain_override=snap_gain_override)
 
     @staticmethod
     def _compute_integrated_jerk(points: List[Tuple[float, float, float]]) -> float:
@@ -398,10 +563,26 @@ class FittsBenchmarkRunner:
         return total_jerk * 1e-6
 
 
+def _build_clutter_distractors(src: FittsTarget, dst: FittsTarget, rng: random.Random) -> List[FittsTarget]:
+    dx = dst.center_x - src.center_x
+    dy = dst.center_y - src.center_y
+    dist = max(1.0, math.hypot(dx, dy))
+    nx, ny = -dy / dist, dx / dist
+    d1_frac = rng.uniform(0.35, 0.75)
+    d1_lat = rng.choice([-1.0, 1.0]) * rng.uniform(18.0, 48.0)
+    d2_ang = rng.uniform(0.0, 2.0 * math.pi)
+    d2_off = dst.width * rng.uniform(1.15, 1.70)
+    return [
+        FittsTarget(900, src.center_x + dx * d1_frac + nx * d1_lat, src.center_y + dy * d1_frac + ny * d1_lat, dst.width, dst.radius),
+        FittsTarget(901, dst.center_x + d2_off * math.cos(d2_ang), dst.center_y + d2_off * math.sin(d2_ang), dst.width, dst.radius),
+    ]
+
+
 def run_benchmark(
     n_targets: int = 16,
     target_widths: List[float] = [24.0, 48.0, 96.0],
-    seed: int = 42
+    seed: int = 42,
+    cluttered: bool = False
 ) -> Dict[str, Any]:
     runner = FittsBenchmarkRunner(circle_radius=280.0, center=(500.0, 500.0))
     conditions = [
@@ -410,7 +591,8 @@ def run_benchmark(
         "viscous_damping",
         "pre_click_lock",
         "magnetic_snapping",
-        "full_gestureflow"
+        "full_gestureflow",
+        "rl_friction"
     ]
 
     all_metrics: Dict[str, List[TrialMetrics]] = {cond: [] for cond in conditions}
@@ -428,9 +610,12 @@ def run_benchmark(
             src = targets[order[idx]]
             dst = targets[order[idx + 1]]
             trial_seed = seed + idx * 17 + int(width)
+            visible_targets = [dst]
+            if cluttered:
+                visible_targets = [dst] + _build_clutter_distractors(src, dst, random.Random(trial_seed + 777))
 
             for cond in conditions:
-                m = runner.run_trial(cond, src, dst, trial_seed)
+                m = runner.run_trial(cond, src, dst, trial_seed, visible_targets=visible_targets)
                 all_metrics[cond].append(m)
 
     # Aggregate condition summary
@@ -460,6 +645,7 @@ def run_benchmark(
             "n_targets": n_targets,
             "target_widths": target_widths,
             "circle_diameter_px": 560.0,
+            "cluttered_distractors": cluttered,
             "total_trials_per_condition": len(all_metrics[conditions[0]])
         },
         "summary": summary
@@ -468,18 +654,19 @@ def run_benchmark(
 
 def format_markdown_table(result: Dict[str, Any]) -> str:
     summary = result["summary"]
-    rows = []
     condition_names = {
         "raw": "1. Raw Pointer (Unfiltered)",
         "one_euro": "2. Static 1€ Filtered Pointer",
         "viscous_damping": "3. + Nonlinear Viscous Damping",
         "pre_click_lock": "4. + Pre-Click Anchor Lock",
         "magnetic_snapping": "5. + Adaptive Magnetic Snapping",
-        "full_gestureflow": "6. Full GestureFlow Engine"
+        "full_gestureflow": "6. Full GestureFlow Engine",
+        "rl_friction": "7. Full GestureFlow + RL Policy"
     }
 
+    clutter_tag = " (Cluttered Multi-Target)" if result["metadata"].get("cluttered_distractors") else ""
     lines = [
-        "# ISO 9241-9 Fitts' Law Benchmark Report",
+        f"# ISO 9241-9 Fitts' Law Benchmark Report{clutter_tag}",
         "",
         f"**Standard**: {result['metadata']['standard']} | "
         f"**Targets**: {result['metadata']['n_targets']} Circular Array | "
@@ -491,6 +678,8 @@ def format_markdown_table(result: Dict[str, Any]) -> str:
     ]
 
     for key, name in condition_names.items():
+        if key not in summary:
+            continue
         s = summary[key]
         lines.append(
             f"| **{name}** | **{s['mean_throughput_bps']:.2f}** | "
@@ -505,10 +694,11 @@ def format_markdown_table(result: Dict[str, Any]) -> str:
 def main():
     parser = argparse.ArgumentParser(description="ISO 9241-9 Fitts' Law Scientific Benchmark")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for deterministic kinematic generation")
+    parser.add_argument("--clutter", action="store_true", help="Include en-route and adjacent distractor targets")
     parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     args = parser.parse_args()
 
-    results = run_benchmark(seed=args.seed)
+    results = run_benchmark(seed=args.seed, cluttered=args.clutter)
 
     if args.json:
         print(json.dumps(results, indent=2))

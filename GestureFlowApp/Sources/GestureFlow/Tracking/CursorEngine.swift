@@ -35,8 +35,11 @@ final class CursorEngine {
     var minCutoffHighSpeed: Double = 2.50
     var speedThreshold: Double = 0.30 // Normalized coordinate velocity threshold (units/sec)
     private(set) var currentCutoff: Double = 0.40
+    private(set) var lastSnapGain: CGFloat? = nil
     private var previousRawAnchor: CGPoint?
     private var smoothedAnchorSpeed: Double = 0.0
+    private var smoothedVelocityPx: CGVector = .zero
+    private var smoothedAccelPx: Double = 0.0
     private let pointFilter = PointFilter2D(minCutoff: 0.40, beta: 0.035, noiseGateThreshold: 0.0008)
 
     // State Tracking
@@ -58,6 +61,8 @@ final class CursorEngine {
 
     public let snappingEngine = MagneticSnappingEngine()
     let intentClassifier = IntentClassifier.shared
+    let dynamicFrictionPolicy = DynamicFrictionPolicy.shared
+    var useRLFrictionPolicy: Bool = false
 
     private var lastClickTimestamp: TimeInterval = 0.0
     private var lastClickPos: CGPoint = .zero
@@ -84,12 +89,19 @@ final class CursorEngine {
     }
 
     func forceDischarge() {
+        resetCursorTrackingState()
+    }
+
+    private func resetCursorTrackingState() {
         cleanReleaseIfNeeded()
         state = .idle
         pointFilter.reset()
         previousRawAnchor = nil
         smoothedAnchorSpeed = 0.0
+        smoothedVelocityPx = .zero
+        smoothedAccelPx = 0.0
         currentCutoff = minCutoffLowSpeed
+        lastSnapGain = nil
         pointFilter.minCutoff = minCutoffLowSpeed
         intentClassifier.reset()
         lastClickTimestamp = 0.0
@@ -132,35 +144,8 @@ final class CursorEngine {
             }
         }
 
-        // 3. Compute Pointing Coordinate (Middle MCP preferred for physiological tremor damping)
+        // 3. Compute Pointing Coordinate & Normalized Apertures
         let anchor = lm.points.count >= 21 ? lm.points[9] : lm.handCentroid
-
-        // Adaptive Viscous Damping Field:
-        // Dynamic cutoff based on anchor velocity v = Δpos / Δt
-        if let prev = previousRawAnchor {
-            let dist = hypot(anchor.x - prev.x, anchor.y - prev.y)
-            let instSpeed = Double(dist) / dt
-            smoothedAnchorSpeed = (smoothedAnchorSpeed == 0.0) ? instSpeed : (0.35 * instSpeed + 0.65 * smoothedAnchorSpeed)
-            let linearRatio = min(1.0, max(0.0, smoothedAnchorSpeed / speedThreshold))
-            let speedRatio = linearRatio * linearRatio // Quadratic nonlinear viscous damping field
-            currentCutoff = minCutoffLowSpeed + (minCutoffHighSpeed - minCutoffLowSpeed) * speedRatio
-            pointFilter.minCutoff = currentCutoff
-        } else {
-            currentCutoff = minCutoffLowSpeed
-            pointFilter.minCutoff = minCutoffLowSpeed
-        }
-        previousRawAnchor = anchor
-
-        let smoothedAnchor = pointFilter.filter(anchor, timestamp: now)
-
-        // Map normalized camera coordinates to display space with edge margin expansion
-        let normX = max(0.0, min(1.0, (1.0 - smoothedAnchor.x - interactionMargin) / (1.0 - 2.0 * interactionMargin)))
-        let normY = max(0.0, min(1.0, (smoothedAnchor.y - interactionMargin) / (1.0 - 2.0 * interactionMargin)))
-        let rawScreenPos = CGPoint(x: normX * screenSize.width, y: normY * screenSize.height)
-        let speedPx = CGFloat(smoothedAnchorSpeed) * screenSize.width
-        let currentScreenPos = snappingEngine.applySnapping(cursorPos: rawScreenPos, speedPxPerSec: speedPx)
-
-        // 4. Compute Normalized Apertures & Velocities
         let wrist = lm.points.count >= 21 ? lm.points[0] : lm.wrist
         let thumbTip = lm.points.count >= 21 ? lm.points[4] : lm.thumbTip
         let indexTip = lm.points.count >= 21 ? lm.points[8] : lm.indexTip
@@ -172,6 +157,68 @@ final class CursorEngine {
         let apertureVelocity = (currentAperture - previousAperture) / CGFloat(dt)
         previousAperture = currentAperture
 
+        // Kinematics (mirrored X velocity and smoothed scalar speed/acceleration in screen px)
+        if let prev = previousRawAnchor {
+            let dist = hypot(anchor.x - prev.x, anchor.y - prev.y)
+            let instSpeed = Double(dist) / dt
+            let prevSpeedPx = smoothedAnchorSpeed * Double(screenSize.width)
+            smoothedAnchorSpeed = (smoothedAnchorSpeed == 0.0) ? instSpeed : (0.35 * instSpeed + 0.65 * smoothedAnchorSpeed)
+            let newSpeedPx = smoothedAnchorSpeed * Double(screenSize.width)
+            let instAccelPx = (newSpeedPx - prevSpeedPx) / dt
+            smoothedAccelPx = 0.4 * instAccelPx + 0.6 * smoothedAccelPx
+
+            let scale = 1.0 / (max(0.1, 1.0 - 2.0 * Double(interactionMargin)) * dt)
+            let instVxPx = Double(-(anchor.x - prev.x)) * Double(screenSize.width) * scale
+            let instVyPx = Double(anchor.y - prev.y) * Double(screenSize.height) * scale
+            smoothedVelocityPx = CGVector(
+                dx: 0.35 * instVxPx + 0.65 * Double(smoothedVelocityPx.dx),
+                dy: 0.35 * instVyPx + 0.65 * Double(smoothedVelocityPx.dy)
+            )
+        } else {
+            smoothedAnchorSpeed = 0.0
+            smoothedVelocityPx = .zero
+            smoothedAccelPx = 0.0
+        }
+        previousRawAnchor = anchor
+
+        // Dynamic Viscous Damping & Magnetic Snap Policy (RL CoreML or Heuristic Fallback)
+        let speedPx = CGFloat(smoothedAnchorSpeed) * screenSize.width
+        let rlSnapGain: CGFloat?
+        if useRLFrictionPolicy {
+            let nearest = snappingEngine.nearestTargetInfo(for: lastValidScreenPos)
+            let action = dynamicFrictionPolicy.evaluate(
+                velocityPx: smoothedVelocityPx,
+                speedPxPerSec: Double(speedPx),
+                accelPxPerSec2: smoothedAccelPx,
+                nearestTarget: nearest,
+                aperture: currentAperture
+            )
+            currentCutoff = action.cutoffHz
+            pointFilter.minCutoff = action.cutoffHz
+            rlSnapGain = action.snapGain
+            lastSnapGain = action.snapGain
+        } else {
+            let linearRatio = min(1.0, max(0.0, smoothedAnchorSpeed / speedThreshold))
+            let speedRatio = linearRatio * linearRatio // Quadratic nonlinear viscous damping field
+            currentCutoff = minCutoffLowSpeed + (minCutoffHighSpeed - minCutoffLowSpeed) * speedRatio
+            pointFilter.minCutoff = currentCutoff
+            rlSnapGain = nil
+            lastSnapGain = nil
+        }
+
+        let smoothedAnchor = pointFilter.filter(anchor, timestamp: now)
+
+        // Map normalized camera coordinates to display space with edge margin expansion
+        let normX = max(0.0, min(1.0, (1.0 - smoothedAnchor.x - interactionMargin) / (1.0 - 2.0 * interactionMargin)))
+        let normY = max(0.0, min(1.0, (smoothedAnchor.y - interactionMargin) / (1.0 - 2.0 * interactionMargin)))
+        let rawScreenPos = CGPoint(x: normX * screenSize.width, y: normY * screenSize.height)
+        let currentScreenPos = snappingEngine.applySnapping(
+            cursorPos: rawScreenPos,
+            speedPxPerSec: speedPx,
+            snapGainOverride: rlSnapGain
+        )
+
+        // 4. Secondary Finger Apertures & Posture Triggers
         let thumbMiddleAperture = hypot(thumbTip.x - middleTip.x, thumbTip.y - middleTip.y) / palmSpan
 
         let isPinchDetected = lm.isPinching || (currentAperture < pinchCommitAperture)
@@ -326,16 +373,7 @@ final class CursorEngine {
     }
 
     private func handleLostHand() {
-        cleanReleaseIfNeeded()
-        state = .idle
-        pointFilter.reset()
-        previousRawAnchor = nil
-        smoothedAnchorSpeed = 0.0
-        currentCutoff = minCutoffLowSpeed
-        pointFilter.minCutoff = minCutoffLowSpeed
-        intentClassifier.reset()
-        lastClickTimestamp = 0.0
-        lastClickPos = .zero
+        resetCursorTrackingState()
     }
 
     private func cleanReleaseIfNeeded() {

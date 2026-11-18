@@ -87,7 +87,8 @@ class TestFittsBenchmark(unittest.TestCase):
             "viscous_damping",
             "pre_click_lock",
             "magnetic_snapping",
-            "full_gestureflow"
+            "full_gestureflow",
+            "rl_friction"
         ]
 
         for cond in expected_conditions:
@@ -97,14 +98,23 @@ class TestFittsBenchmark(unittest.TestCase):
             self.assertGreater(s["target_accuracy_pct"], 60.0)
             self.assertGreater(s["mean_integrated_jerk"], 0.0)
 
-        # Full engine should have higher accuracy and 0 overshoots
+        # Full engine and RL policy should achieve 0 overshoots and match/exceed raw accuracy
         self.assertEqual(summary["full_gestureflow"]["mean_overshoots"], 0.0)
-        self.assertGreaterEqual(summary["full_gestureflow"]["target_accuracy_pct"], summary["raw"]["target_accuracy_pct"])
+        self.assertEqual(summary["rl_friction"]["mean_overshoots"], 0.0)
+        self.assertEqual(summary["rl_friction"]["mean_click_deflection_px"], 0.0)
+        self.assertGreaterEqual(summary["rl_friction"]["target_accuracy_pct"], summary["raw"]["target_accuracy_pct"])
 
         # Markdown formatting check
         md = format_markdown_table(results)
         self.assertIn("ISO 9241-9 Fitts' Law Benchmark Report", md)
-        self.assertIn("Full GestureFlow Engine", md)
+        self.assertIn("Full GestureFlow + RL Policy", md)
+
+    def test_cluttered_distractor_benchmark(self):
+        results = run_benchmark(n_targets=8, target_widths=[48.0], seed=99, cluttered=True)
+        self.assertTrue(results["metadata"]["cluttered_distractors"])
+        rl_summary = results["summary"]["rl_friction"]
+        self.assertGreaterEqual(rl_summary["target_accuracy_pct"], results["summary"]["raw"]["target_accuracy_pct"])
+        self.assertEqual(rl_summary["mean_click_deflection_px"], 0.0)
 
 
 if __name__ == "__main__":
