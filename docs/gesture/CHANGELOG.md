@@ -52,6 +52,7 @@ This section records the complete hands-free master plan executed directly on `m
 | **WP36 — ISO 9241-9 Fitts' Law Scientific Benchmark Harness** | DONE | `40eb4e8` | Implemented standardized 16-target ISO 9241-9 Fitts' Law benchmark harness (`tools/bench_fitts.py`) evaluating 6 ablation conditions across throughput, movement time, accuracy, jerk, and click deflection. Added `tools/test_bench_fitts.py` (5 tests, 47/47 passing). |
 | **WP37 — Context-Aware Desktop Infrastructure & Concurrency Hardening** | DONE | `3bf5fc1` | Implemented non-blocking OS `DesktopContextProvider`, 6-class `ResearchIntent` taxonomy, lock-synchronized `DatasetRecorder` thread-safety (200-frame stress test), and backward-compatible JSONL schema with 9 new tests (43/43 passing). |
 | **WP38 — Causal Temporal Intent Sequence Model for Anticipatory Pre-Click Locking** | DONE | `136973a` | Implemented $K=10$ sliding window causal temporal sequence model (`IntentClassifier.swift`), synthetic sequence generation, CoreML MLP export (95% F1), and anticipatory pre-click locking in `CursorEngine.swift` (48/48 Swift tests, 49/49 Python tests passing). |
+| **WP39 — PPO RL Dynamic Friction & Magnetic Snapping Policy** | DONE | `8b7dfb9` | Implemented pure-NumPy PPO trainer (`tools/train_rl_friction.py`), CoreML policy `DynamicFrictionPolicy.mlmodel` / `.swift`, `MagneticSnappingEngine` gain override + `CursorEngine` opt-in hook, and cluttered Fitts' Law evaluation (`bench_fitts.py`): 100.0% accuracy, 5.91 bits/s, -5.0% jerk, 0.00 px deflection (53 Swift, 53 Python tests passing). |
 
 
 

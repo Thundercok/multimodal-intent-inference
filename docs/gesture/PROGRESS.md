@@ -658,5 +658,27 @@
 - Live behaviour change: Anticipatory pre-click coordinate lock activates $35\text{–}50\text{ ms}$ prior to physical pinch contact via temporal sequence inference.
 - NEEDS-USER: none
 
+## 2026-11-19: WP39 — PPO RL Dynamic Friction & Magnetic Snapping Policy (Phase 3)
+- Status: DONE
+- Commits: `8b7dfb9` feat(rl): implement PPO dynamic friction & snapping policy for spatial pointer
+- What changed:
+  - Addressed Module 2 RL Optimal Control milestone of `RESEARCH_ROADMAP.md`:
+    1. **Pure-NumPy Continuous PPO Trainer (`tools/train_rl_friction.py`)**: Formulated a zero-oracle 6D target-agnostic observation (`norm_speed`, `norm_signed_accel`, `has_target_prox`, `norm_target_dist`, `radial_alignment`, `aperture_ratio`) and bounded 2D continuous control action (`cutoffHz` $\in [0.25, 4.0]\text{ Hz}$, `snapGain` $\in [0.0, 0.85]$). Warm-started 2-layer MLP (`6 -> 32 -> 32 -> 2`) via behavior cloning and fine-tuned via clipped PPO + GAE against Flash & Hogan minimum-jerk Fitts' Law physics with 8–12 Hz physiological tremor and multi-target clutter distractors.
+    2. **CoreML Export & Swift Integration**: Exported `DynamicFrictionPolicy.mlmodel` (`obs_features` -> `action_tanh`) via `coremltools` MIL builder and implemented `DynamicFrictionPolicy.swift` with analytical fallback. Extended `MagneticSnappingEngine.swift` with `nearestTargetInfo(for:)` and `snapGainOverride`, and wired `useRLFrictionPolicy` into `CursorEngine.swift` (opt-in flag preserving 100% golden replay determinism).
+    3. **Fitts' Law Benchmark & Empirical Out-of-Sample Evaluation**: Extended `tools/bench_fitts.py` with Condition 7 (`rl_friction`) and `--clutter` distractor suite.
+       - ISO 9241-9 Clean (45 trials): Throughput **5.91 bits/s** (vs 5.90 heuristic), **100.0% Accuracy**, **0.00 Overshoots**, **366,101.4 Integrated Jerk** (-5.0% vs 385,361.9 heuristic), **0.00 px Click Deflection**.
+       - ISO 9241-9 Cluttered Multi-Target (45 trials): Throughput **5.92 bits/s**, **100.0% Accuracy**, **0.00 Overshoots**, **0.00 px Click Deflection**.
+       - Out-of-sample 100 unseen test seeds (`3000..3099`): Clean Acc **94.0%** (vs 93.0%), TP **5.844** (vs 5.821), Overshoots **0.000** (vs 0.010), Jerk **371,268.6** (vs 384,327.7).
+  - Added unit test suites:
+    - `GestureFlowApp/Tests/GestureFlowTests/DynamicFrictionPolicyTests.swift` (5 tests): model loading, 6D observation parity, bounded action outputs, fallback safety, and end-to-end `CursorEngine` integration.
+    - `tools/test_train_rl_friction.py` (3 tests) & extended `tools/test_bench_fitts.py` (`rl_friction` + cluttered benchmark tests).
+- Verification (verbatim):
+  - `swift build --package-path GestureFlowApp` → `Build complete!` (0 errors, 0 warnings)
+  - `swift test --package-path GestureFlowApp` → `Executed 53 tests, with 0 failures (0 unexpected) in 0.509 (0.530) seconds`
+  - `python3 -m unittest discover -s tools -p "test_*.py"` → `Ran 53 tests in 26.444s OK`
+  - `python3 tools/test_replay.py` → `Ran 4 tests in 3.711s OK` (15/15 fixtures 100% byte-for-byte identical)
+- Live behaviour change: Opt-in `CursorEngine.useRLFrictionPolicy` dispatches dynamic CoreML viscosity & target-aligned magnetic snapping gain inside the pointer tracking loop.
+- NEEDS-USER: none
+
 
 
