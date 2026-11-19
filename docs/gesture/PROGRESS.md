@@ -680,5 +680,22 @@
 - Live behaviour change: Opt-in `CursorEngine.useRLFrictionPolicy` dispatches dynamic CoreML viscosity & target-aligned magnetic snapping gain inside the pointer tracking loop.
 - NEEDS-USER: none
 
+## 2026-11-19: WP40 — Lightweight Context-Conditioned Multimodal Intent Fusion (Experiment 001)
+- Status: DONE
+- Commits: `23ffeb4` feat(context): implement O(1) Bayesian context-conditioned intent fusion
+- What changed:
+  - Implemented closed-form $O(1)$ Bayesian posterior fusion (microsecond cost, zero extra CoreML/neural weights):
+    1. **`ContextIntentFusion.swift`**: Fuses visual `IntentPrediction` probabilities with context priors derived from `DesktopContextProvider` (`appCategory`, `focusedElementRole`, `windowState`) via $P(M_t \mid X, C) \propto P(M_t \mid X) \cdot \pi(M_t \mid C)$. Strictly falls back to uniform $[1,1,1,1,1]$ passthrough when accessibility or app context is unavailable.
+    2. **Typing Safety Guard**: Suppresses ambiguous `pre_click` jitter and accidental macro swipes while focused inside `AXTextArea`/`AXTextField` (`code_editor` / `communication`), while allowing strong deliberate clamps ($P_{\text{vision}} \ge 0.90$) through.
+    3. **CursorEngine Integration**: Wired `useContextFusion` opt-in toggle and `lastIntentPrediction` into `CursorEngine.swift` preserving 100% golden replay parity.
+    4. **Lightweight Evaluation Harness**: Implemented `tools/eval_context_fusion.py` and `tools/test_context_fusion.py` (< 0.01s execution): reduced simulated typing false-positive rate from **100.0% $\to$ 0.0%**, preserved **100.0%** deliberate click recall, and improved borderline browser scroll disambiguation from **48.3% $\to$ 81.0%**.
+  - Added Swift unit test suite `GestureFlowApp/Tests/GestureFlowTests/ContextIntentFusionTests.swift` (5 tests): unavailable fallback passthrough, typing suppression vs. strong pinch override, browser scroll area resolution, macro guard, and end-to-end `CursorEngine` integration.
+- Verification (verbatim):
+  - `swift test --package-path GestureFlowApp` → `Executed 58 tests, with 0 failures (0 unexpected) in 0.285 (0.292) seconds`
+  - `python3 tools/eval_context_fusion.py` + `python3 -m unittest tools/test_context_fusion.py -v` → `Ran 3 tests in 0.006s OK`
+  - `python3 tools/test_replay.py` → `Ran 4 tests in 8.076s OK` (15/15 fixtures 100% byte-for-byte identical)
+- Live behaviour change: Opt-in `CursorEngine.useContextFusion` modulates real-time intent probabilities and suppresses typing misfires using cached OS context.
+- NEEDS-USER: none
+
 
 
