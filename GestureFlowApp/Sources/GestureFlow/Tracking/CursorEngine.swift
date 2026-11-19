@@ -63,6 +63,9 @@ final class CursorEngine {
     let intentClassifier = IntentClassifier.shared
     let dynamicFrictionPolicy = DynamicFrictionPolicy.shared
     var useRLFrictionPolicy: Bool = false
+    var contextFusion: ContextIntentFusion = .shared
+    var useContextFusion: Bool = false
+    private(set) var lastIntentPrediction: IntentPrediction = .fallback
 
     private var lastClickTimestamp: TimeInterval = 0.0
     private var lastClickPos: CGPoint = .zero
@@ -104,6 +107,7 @@ final class CursorEngine {
         lastSnapGain = nil
         pointFilter.minCutoff = minCutoffLowSpeed
         intentClassifier.reset()
+        lastIntentPrediction = .fallback
         lastClickTimestamp = 0.0
         lastClickPos = .zero
     }
@@ -224,8 +228,12 @@ final class CursorEngine {
         let isPinchDetected = lm.isPinching || (currentAperture < pinchCommitAperture)
         let isMiddlePinchDetected = (thumbMiddleAperture < pinchCommitAperture) && (thumbMiddleAperture < currentAperture - 0.08) && (currentAperture > pinchReleaseAperture)
 
-        // Evaluate temporal causal intent sequence
-        let intentPred = intentClassifier.process(landmarks: lm)
+        // Evaluate temporal causal intent sequence (optionally modulated by Bayesian OS context fusion)
+        let rawIntentPred = intentClassifier.process(landmarks: lm)
+        let intentPred = useContextFusion
+            ? contextFusion.fuse(prediction: rawIntentPred, preClickThreshold: intentClassifier.preClickThreshold)
+            : rawIntentPred
+        lastIntentPrediction = intentPred
 
         // 5. State Machine Transition Logic
         switch state {
