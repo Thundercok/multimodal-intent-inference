@@ -1,7 +1,7 @@
 # Multimodal Intent Inference
 
 <p align="center">
-  <strong>GestureFlow — context-aware, hands-free interaction for macOS using hand motion and desktop context.</strong>
+  <strong>GestureFlow — hands-free macOS interaction using hand motion, with an experimental desktop-context fusion path.</strong>
 </p>
 
 <p align="center">
@@ -18,10 +18,10 @@
 
 This repository explores **multimodal intent inference for hands-free desktop interaction**. Its main runnable application is **GestureFlow**, a native macOS controller that turns camera-observed hand movements into system actions.
 
-The interaction pipeline combines two kinds of context:
+The design explores two complementary signal sources:
 
 - **Visual and temporal hand signals:** Apple Vision hand-pose landmarks, normalized hand geometry, posture, motion, and gesture history.
-- **Local desktop context:** active application and accessibility metadata, when the operating system exposes them.
+- **Optional desktop context:** active-application and accessibility metadata, when the operating system exposes them and context fusion is explicitly enabled.
 
 The goal is not simply to recognize a pose. The system must distinguish deliberate interaction from incidental movement, prevent competing gesture modes from firing at the same time, and map accepted intent to predictable macOS actions.
 
@@ -39,7 +39,7 @@ The native Swift application includes:
   - **Spatial Zoom:** two-hand pinch-and-spread magnification.
   - **Spatial App Switcher:** open-palm arming followed by pinch-and-scrub selection.
 - **Intent arbitration:** a shared arbiter, cooldowns, and explicit action commitment to prevent cross-gesture conflicts.
-- **Desktop-context hooks:** accessibility context can help suppress ambiguous actions during text entry or resolve borderline interactions. Unavailable context is handled through a conservative fallback.
+- **Experimental desktop-context fusion:** a separate module can apply active-app and accessibility-role priors to temporal intent predictions. It is disabled by default in `CursorEngine`; tests exercise its behavior during text entry and over scrollable UI. When context is unavailable, it uses neutral priors rather than inventing context.
 - **Data collection and replay:** guided/manual JSONL recording, incident capture, deterministic headless replay, and offline evaluation tools.
 - **Optional Core ML components:** posture and temporal-intent inference hooks. The posture classifier is designed to run in shadow mode before any promotion to live actuation.
 
@@ -50,7 +50,7 @@ flowchart TD
     Camera[Camera frames] --> Vision[Apple Vision hand / face detection]
     Vision --> Features[Landmark filtering and kinematic features]
     Features --> Modes[Scroll, navigation, zoom and cursor engines]
-    Context[Local desktop / accessibility context] --> Fusion[Context-aware intent handling]
+    Context[Optional local desktop / accessibility context] --> Fusion[Experimental context fusion]
     Features --> Fusion
     Modes --> Arbiter[Intent arbiter and cooldowns]
     Fusion --> Arbiter
@@ -67,7 +67,7 @@ The native processing path is organized around these responsibilities:
 | `CameraManager` / Apple Vision | Camera capture and hand/face landmark detection |
 | `HandFeatureExtractor` | Landmark cleanup, normalization, and kinematic features |
 | `GestureEngine` / `ScrollEngine` | Mode-specific gesture state machines |
-| `ContextIntentFusion` | Combines classifier output with available desktop context |
+| `ContextIntentFusion` | Optional experimental module that adjusts classifier probabilities using app-category and accessibility-role priors |
 | `IntentArbiter` | Mutual exclusion, cooldowns, and committed-action tracking |
 | `ActionSink` / `ActionDispatcher` | Scroll synthesis and macOS system actions |
 | `DatasetRecorder` / `IncidentRecorder` | Local recording for evaluation and debugging |
@@ -163,7 +163,7 @@ A replay throughput measurement is documented in [PERFORMANCE.md](docs/gesture/P
 
 The optional posture classifier is evaluated in shadow mode and is not enabled to control live gestures by default. The current [model card](docs/gesture/MODEL_CARD.md) marks real-recording validation as **blocked pending user sessions**. It requires held-out real recordings and comparison against the heuristic baseline before learned predictions can drive live actuation.
 
-The temporal intent classifier also falls back when a compatible Core ML model is unavailable. The research roadmap describes future directions; proposed GNN/sequence-model and reinforcement-learning components are not claims about the current default runtime.
+The temporal intent classifier also falls back when a compatible Core ML model is unavailable; context fusion is an opt-in path rather than the default cursor configuration. The research roadmap describes future directions; proposed GNN/sequence-model and reinforcement-learning components are not claims about the current default runtime.
 
 No end-to-end real-user accuracy figure is claimed here. See [Findings](docs/gesture/FINDINGS.md), [Robustness Notes](docs/gesture/ROBUSTNESS.md), and the [Research Roadmap](RESEARCH_ROADMAP.md) for scope, evidence, and open work.
 
